@@ -2,7 +2,7 @@ name: Database Keep-Alive-TG Ping and Log
 
 on:
   schedule:
-    - cron: '47 * * * *' # 保持你的原有时间
+    - cron: '47 * * * *'  # 保持你的原有时间
   workflow_dispatch:
 
 jobs:
@@ -43,7 +43,7 @@ jobs:
           fi
 
       - name: Send Telegram Notification on Failure
-        if: failure()  # 只有当之前的步骤失败时才执行
+        if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -55,31 +55,24 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           
           # 构建通知消息
-          MESSAGE="🚨 *数据库保活失败警告* 🚨
+          MESSAGE="🚨 Database Keep-Alive Failure Alert 🚨
           
-❌ 时间: ${CURRENT_TIME}
-📁 仓库: ${{ github.repository }}
-🔗 操作: [查看详情](${RUN_URL})
-💾 数据库: ${DB_HOST}/${DB_NAME}
-📝 状态: 数据库连接或操作失败，请立即检查！
-
-请检查以下可能原因：
-• 数据库连接信息是否正确
-• 网络是否可达
-• 数据库服务是否正常运行
-• SSL证书是否有效"
+❌ Time: ${CURRENT_TIME}
+📁 Repository: ${{ github.repository }}
+🔗 Action: ${RUN_URL}
+💾 Database: ${DB_HOST}/${DB_NAME}
+⚠️ Status: Database connection or operation failed, please check immediately!"
           
           # 发送Telegram消息
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}" \
-            -d parse_mode="Markdown" \
             -d disable_web_page_preview="true"
           
           echo "Telegram notification sent"
 
-      - name: Send Telegram Success Notification (Optional)
-        if: success()  # 可选：成功时也发送通知
+      - name: Send Telegram Success Notification
+        if: success()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -87,13 +80,12 @@ jobs:
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-          MESSAGE="✅ *数据库保活成功* 
+          MESSAGE="✅ Database Keep-Alive Success 
           
-⏰ 时间: ${CURRENT_TIME}
-💾 数据库: ${DB_HOST}/${DB_NAME}
-📊 状态: 保活记录已成功插入"
+⏰ Time: ${CURRENT_TIME}
+💾 Database: ${DB_HOST}/${DB_NAME}
+📊 Status: Keep-alive record successfully inserted"
           
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="${MESSAGE}" \
-            -d parse_mode="Markdown"
+            -d text="${MESSAGE}"
