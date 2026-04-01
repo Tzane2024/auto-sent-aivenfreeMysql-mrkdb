@@ -2,7 +2,7 @@ name: Database Keep-Alive-TG Ping and Log
 
 on:
   schedule:
-    - cron: '47 * * * *'  # 保持你的原有时间
+    - cron: '47 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -21,24 +21,19 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 使用 heredoc 方式执行一个完整的SQL脚本，避免密码出现在进程列表里
           if mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           CREATE TABLE IF NOT EXISTS bh (
             id INT AUTO_INCREMENT PRIMARY KEY,
             ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          
           INSERT INTO bh (ping_time) VALUES (NOW());
-          
           SELECT * FROM bh ORDER BY ping_time DESC LIMIT 3;
           EOF
           then
-            echo "status=success" >> $GITHUB_OUTPUT
-            echo "✅ Success: The 'bh' table has been ensured and a ping log was inserted."
+            echo "✅ Success: Database operation completed."
           else
-            echo "status=failure" >> $GITHUB_OUTPUT
-            echo "❌ Error: The operation failed. Check the connection details and SQL syntax."
+            echo "❌ Error: Database operation failed."
             exit 1
           fi
 
@@ -47,45 +42,19 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DB_HOST: ${{ secrets.AVN_DB_HOST }}
-          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 获取当前时间和GitHub Action信息
-          CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
-          # 构建通知消息
-          MESSAGE="🚨 Database Keep-Alive Failure Alert 🚨
-          
-❌ Time: ${CURRENT_TIME}
-📁 Repository: ${{ github.repository }}
-🔗 Action: ${RUN_URL}
-💾 Database: ${DB_HOST}/${DB_NAME}
-⚠️ Status: Database connection or operation failed, please check immediately!"
-          
-          # 发送Telegram消息
+          MESSAGE="Database keep-alive failed at $(date) - Repository: ${{ github.repository }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="${MESSAGE}" \
-            -d disable_web_page_preview="true"
-          
-          echo "Telegram notification sent"
+            -d text="${MESSAGE}"
 
       - name: Send Telegram Success Notification
         if: success()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DB_HOST: ${{ secrets.AVN_DB_HOST }}
-          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-          MESSAGE="✅ Database Keep-Alive Success 
-          
-⏰ Time: ${CURRENT_TIME}
-💾 Database: ${DB_HOST}/${DB_NAME}
-📊 Status: Keep-alive record successfully inserted"
-          
+          MESSAGE="Database keep-alive succeeded at $(date) - Repository: ${{ github.repository }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
