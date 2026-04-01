@@ -1,0 +1,99 @@
+name: Database Keep-Alive Ping and Log
+
+on:
+  schedule:
+    - cron: '47 * * * *' # 保持你的原有时间
+  workflow_dispatch:
+
+jobs:
+  ping-and-log:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install MySQL Client
+        run: sudo apt-get update && sudo apt-get install -y mysql-client
+
+      - name: Check Table, Create if not exists, and Insert Log
+        id: database_operation
+        env:
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
+        run: |
+          # 使用 heredoc 方式执行一个完整的SQL脚本，避免密码出现在进程列表里
+          if mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          CREATE TABLE IF NOT EXISTS bh (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+          
+          INSERT INTO bh (ping_time) VALUES (NOW());
+          
+          SELECT * FROM bh ORDER BY ping_time DESC LIMIT 3;
+          EOF
+          then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ Success: The 'bh' table has been ensured and a ping log was inserted."
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "❌ Error: The operation failed. Check the connection details and SQL syntax."
+            exit 1
+          fi
+
+      - name: Send Telegram Notification on Failure
+        if: failure()  # 只有当之前的步骤失败时才执行
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
+        run: |
+          # 获取当前时间和GitHub Action信息
+          CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          # 构建通知消息
+          MESSAGE="🚨 *数据库保活失败警告* 🚨
+          
+❌ 时间: ${CURRENT_TIME}
+📁 仓库: ${{ github.repository }}
+🔗 操作: [查看详情](${RUN_URL})
+💾 数据库: ${DB_HOST}/${DB_NAME}
+📝 状态: 数据库连接或操作失败，请立即检查！
+
+请检查以下可能原因：
+• 数据库连接信息是否正确
+• 网络是否可达
+• 数据库服务是否正常运行
+• SSL证书是否有效"
+          
+          # 发送Telegram消息
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="${MESSAGE}" \
+            -d parse_mode="Markdown" \
+            -d disable_web_page_preview="true"
+          
+          echo "Telegram notification sent"
+
+      - name: Send Telegram Success Notification (Optional)
+        if: success()  # 可选：成功时也发送通知
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
+        run: |
+          CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+          MESSAGE="✅ *数据库保活成功* 
+          
+⏰ 时间: ${CURRENT_TIME}
+💾 数据库: ${DB_HOST}/${DB_NAME}
+📊 状态: 保活记录已成功插入"
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="${MESSAGE}" \
+            -d parse_mode="Markdown"
