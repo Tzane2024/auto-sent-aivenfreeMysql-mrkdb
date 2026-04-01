@@ -2,7 +2,7 @@ name: Database Keep-Alive Ping and Log
 
 on:
   schedule:
-    - cron: '43 * * * *' # 保持你的原有时间
+    - cron: '47 * * * *' # 保持你的原有时间
   workflow_dispatch:
 
 jobs:
