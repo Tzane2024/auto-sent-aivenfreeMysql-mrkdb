@@ -28,17 +28,16 @@ jobs:
             remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           
-          -- 状态表：记录最后一次通知的状态
+          -- 状态表：记录最后一次成功通知的状态（仅用于成功去重）
           CREATE TABLE IF NOT EXISTS keepalive_notify_status (
             id INT PRIMARY KEY DEFAULT 1,
-            last_outcome VARCHAR(10) NOT NULL DEFAULT 'success',
-            last_notified_at TIMESTAMP NULL,
+            last_success_notified_at TIMESTAMP NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           
           -- 初始化状态表（如果为空）
-          INSERT IGNORE INTO keepalive_notify_status (id, last_outcome, last_notified_at)
-          VALUES (1, 'success', NULL);
+          INSERT IGNORE INTO keepalive_notify_status (id, last_success_notified_at)
+          VALUES (1, NULL);
           EOF
 
       - name: Database Keep-Alive Operation
@@ -64,8 +63,9 @@ jobs:
             exit 1
           fi
 
-      - name: Get Last Notification Status
-        id: get_last_status
+      - name: Check If Success Notification Should Be Sent
+        id: check_success_notify
+        if: success()
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -73,16 +73,24 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 查询最后一次通知的状态
-          LAST_OUTCOME=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
-          SELECT last_outcome FROM keepalive_notify_status WHERE id = 1;
+          # 查询上次成功通知的时间
+          LAST_NOTIFIED=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
+          SELECT last_success_notified_at FROM keepalive_notify_status WHERE id = 1;
           EOF
           )
-          echo "last_outcome=$LAST_OUTCOME" >> $GITHUB_OUTPUT
-          echo "Last notified outcome: $LAST_OUTCOME"
+          
+          # 如果从未发送过成功通知，或者上次成功通知时间超过 23 小时（避免每天发多次）
+          # 这里使用简单逻辑：如果 last_success_notified_at 为 NULL，则发送
+          if [ -z "$LAST_NOTIFIED" ] || [ "$LAST_NOTIFIED" = "NULL" ]; then
+            echo "should_notify=true" >> $GITHUB_OUTPUT
+            echo "首次成功运行，将发送成功通知"
+          else
+            echo "should_notify=false" >> $GITHUB_OUTPUT
+            echo "已经发送过成功通知，本次不再重复发送"
+          fi
 
-      - name: Send Telegram Notification on Failure
-        if: failure() && steps.get_last_status.outputs.last_outcome != 'failure'
+      - name: Send Telegram Failure Notification
+        if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -97,15 +105,16 @@ jobs:
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
           
-          # 更新状态表，记录已发送失败通知
+          # 失败时，清除成功通知标记（这样恢复成功后可以再次发送成功通知）
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           UPDATE keepalive_notify_status 
-          SET last_outcome = 'failure', last_notified_at = NOW() 
+          SET last_success_notified_at = NULL 
           WHERE id = 1;
           EOF
+          echo "失败通知已发送，已清除成功通知标记"
 
       - name: Send Telegram Success Notification
-        if: success() && steps.get_last_status.outputs.last_outcome != 'success'
+        if: success() && steps.check_success_notify.outputs.should_notify == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -120,26 +129,15 @@ jobs:
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
           
-          # 更新状态表，记录已发送成功通知
+          # 更新成功通知时间
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           UPDATE keepalive_notify_status 
-          SET last_outcome = 'success', last_notified_at = NOW() 
+          SET last_success_notified_at = NOW() 
           WHERE id = 1;
           EOF
+          echo "成功通知已发送"
 
-      - name: Update Status on No Notification (Same Status)
-        if: always() && ( (success() && steps.get_last_status.outputs.last_outcome == 'success') || (failure() && steps.get_last_status.outputs.last_outcome == 'failure') )
-        env:
-          DB_HOST: ${{ secrets.AVN_DB_HOST }}
-          DB_PORT: ${{ secrets.AVN_DB_PORT }}
-          DB_USER: ${{ secrets.AVN_DB_USER }}
-          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
-          DB_NAME: ${{ secrets.AVN_DB_NAME }}
+      - name: Success Without Notification
+        if: success() && steps.check_success_notify.outputs.should_notify == 'false'
         run: |
-          # 状态未变化，不发送通知，但更新时间戳
-          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          UPDATE keepalive_notify_status 
-          SET updated_at = NOW() 
-          WHERE id = 1;
-          EOF
-          echo "Status unchanged (${{ steps.database_operation.outputs.current_outcome }}), no notification sent."
+          echo "✅ Database operation succeeded, but success notification already sent before (only first success after failure triggers notification)"
