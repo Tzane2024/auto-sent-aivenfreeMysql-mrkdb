@@ -12,7 +12,7 @@ jobs:
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
 
-      - name: Check and Create Required Tables
+      - name: Check and Create Table
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -21,23 +21,13 @@ jobs:
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          -- 主表：记录每次 ping
           CREATE TABLE IF NOT EXISTS bh (
             id INT AUTO_INCREMENT PRIMARY KEY,
             ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
+            remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive',
+            outcome VARCHAR(10) DEFAULT NULL,
+            notified BOOLEAN DEFAULT FALSE
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          
-          -- 状态表：记录最后一次成功通知的状态（仅用于成功去重）
-          CREATE TABLE IF NOT EXISTS keepalive_notify_status (
-            id INT PRIMARY KEY DEFAULT 1,
-            last_success_notified_at TIMESTAMP NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          
-          -- 初始化状态表（如果为空）
-          INSERT IGNORE INTO keepalive_notify_status (id, last_success_notified_at)
-          VALUES (1, NULL);
           EOF
 
       - name: Database Keep-Alive Operation
@@ -49,9 +39,9 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 执行数据库插入和查询
+          # 执行数据库插入
           if mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          INSERT INTO bh (ping_time) VALUES (NOW());
+          INSERT INTO bh (ping_time, outcome, notified) VALUES (NOW(), 'success', FALSE);
           SELECT * FROM bh ORDER BY ping_time DESC LIMIT 3;
           EOF
           then
@@ -73,17 +63,18 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 查询上次成功通知的时间
-          LAST_NOTIFIED=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
-          SELECT last_success_notified_at FROM keepalive_notify_status WHERE id = 1;
+          # 查询最近一次成功且已通知的记录
+          LAST_SUCCESS_NOTIFIED=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
+          SELECT id FROM bh 
+          WHERE outcome = 'success' AND notified = TRUE 
+          ORDER BY ping_time DESC LIMIT 1;
           EOF
           )
           
-          # 如果从未发送过成功通知，或者上次成功通知时间超过 23 小时（避免每天发多次）
-          # 这里使用简单逻辑：如果 last_success_notified_at 为 NULL，则发送
-          if [ -z "$LAST_NOTIFIED" ] || [ "$LAST_NOTIFIED" = "NULL" ]; then
+          # 如果从未发送过成功通知，则发送
+          if [ -z "$LAST_SUCCESS_NOTIFIED" ]; then
             echo "should_notify=true" >> $GITHUB_OUTPUT
-            echo "首次成功运行，将发送成功通知"
+            echo "首次成功运行（或失败后恢复），将发送成功通知"
           else
             echo "should_notify=false" >> $GITHUB_OUTPUT
             echo "已经发送过成功通知，本次不再重复发送"
@@ -105,13 +96,11 @@ jobs:
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
           
-          # 失败时，清除成功通知标记（这样恢复成功后可以再次发送成功通知）
+          # 失败时，插入失败记录并标记为已通知
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          UPDATE keepalive_notify_status 
-          SET last_success_notified_at = NULL 
-          WHERE id = 1;
+          INSERT INTO bh (ping_time, outcome, notified) VALUES (NOW(), 'failure', TRUE);
           EOF
-          echo "失败通知已发送，已清除成功通知标记"
+          echo "失败通知已发送"
 
       - name: Send Telegram Success Notification
         if: success() && steps.check_success_notify.outputs.should_notify == 'true'
@@ -129,15 +118,27 @@ jobs:
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
           
-          # 更新成功通知时间
+          # 更新刚插入的那条成功记录，标记为已通知
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          UPDATE keepalive_notify_status 
-          SET last_success_notified_at = NOW() 
-          WHERE id = 1;
+          UPDATE bh 
+          SET notified = TRUE 
+          WHERE id = (SELECT * FROM (SELECT MAX(id) FROM bh WHERE outcome = 'success') AS tmp);
           EOF
           echo "成功通知已发送"
 
       - name: Success Without Notification
         if: success() && steps.check_success_notify.outputs.should_notify == 'false'
+        env:
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
+          # 更新刚插入的成功记录，标记为不需要通知
+          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          UPDATE bh 
+          SET notified = TRUE 
+          WHERE id = (SELECT * FROM (SELECT MAX(id) FROM bh WHERE outcome = 'success') AS tmp);
+          EOF
           echo "✅ Database operation succeeded, but success notification already sent before (only first success after failure triggers notification)"
