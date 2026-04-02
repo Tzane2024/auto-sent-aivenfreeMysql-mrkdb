@@ -63,24 +63,15 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 查询最近一次成功且已通知的记录ID
-          LAST_SUCCESS_NOTIFIED=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
-          SELECT id FROM bh 
-          WHERE outcome = 'success' AND notified = TRUE 
-          ORDER BY ping_time DESC LIMIT 1;
+          # 查询是否存在任何已通知的成功记录
+          HAS_NOTIFIED_SUCCESS=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
+          SELECT COUNT(*) FROM bh 
+          WHERE outcome = 'success' AND notified = TRUE;
           EOF
           )
           
-          # 查询最近一次成功的记录ID（不管是否通知）
-          LAST_SUCCESS=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
-          SELECT id FROM bh 
-          WHERE outcome = 'success' 
-          ORDER BY ping_time DESC LIMIT 1;
-          EOF
-          )
-          
-          # 如果最近一次成功记录就是已通知的记录，则不发送；否则发送
-          if [ -z "$LAST_SUCCESS_NOTIFIED" ] || [ "$LAST_SUCCESS" != "$LAST_SUCCESS_NOTIFIED" ]; then
+          # 如果没有已通知的成功记录，则发送通知
+          if [ "$HAS_NOTIFIED_SUCCESS" -eq 0 ]; then
             echo "should_notify=true" >> $GITHUB_OUTPUT
             echo "需要发送成功通知（首次成功或失败后恢复）"
           else
@@ -150,3 +141,20 @@ jobs:
           WHERE id = (SELECT * FROM (SELECT MAX(id) FROM bh WHERE outcome = 'success') AS tmp);
           EOF
           echo "✅ Database operation succeeded, but success notification already sent before (only first success after failure triggers notification)"
+
+      - name: Clear Success Notifications on Failure
+        if: failure()
+        env:
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
+        run: |
+          # 失败时，清除所有成功记录的通知标记，以便恢复成功后能再次发送成功通知
+          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          UPDATE bh 
+          SET notified = FALSE 
+          WHERE outcome = 'success';
+          EOF
+          echo "已清除所有成功记录的通知标记，恢复成功后将会发送成功通知"
