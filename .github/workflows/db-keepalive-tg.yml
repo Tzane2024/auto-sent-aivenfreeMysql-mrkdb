@@ -12,9 +12,7 @@ jobs:
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
 
-      # 1. 创建表（只在成功时才会执行完整，但失败时也会尝试）
       - name: Check and Create Tables
-        continue-on-error: true  # 即使失败也不影响后续
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -23,23 +21,28 @@ jobs:
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          -- 日志表：记录每次 ping
           CREATE TABLE IF NOT EXISTS bh (
             id INT AUTO_INCREMENT PRIMARY KEY,
             ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
-          );
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+          
+          -- 状态表：记录最后一次运行状态
           CREATE TABLE IF NOT EXISTS keepalive_state (
             id INT PRIMARY KEY DEFAULT 1,
             last_status VARCHAR(10) DEFAULT 'unknown',
+            last_notified_status VARCHAR(10) DEFAULT 'unknown',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          );
-          INSERT IGNORE INTO keepalive_state (id, last_status) VALUES (1, 'unknown');
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+          
+          -- 初始化状态表（如果为空）
+          INSERT IGNORE INTO keepalive_state (id, last_status, last_notified_status) 
+          VALUES (1, 'unknown', 'unknown');
           EOF
 
-      # 2. 获取上次运行状态（只用于判断是否发送成功通知，失败时此步骤可能失败但没关系）
-      - name: Get Last Run Status
+      - name: Get Last Notified Status
         id: get_status
-        continue-on-error: true
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -47,16 +50,17 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          LAST_STATUS=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
-          SELECT last_status FROM keepalive_state WHERE id = 1;
+          # 查询上次已通知的状态
+          LAST_NOTIFIED=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
+          SELECT last_notified_status FROM keepalive_state WHERE id = 1;
           EOF
           )
-          echo "last_status=${LAST_STATUS:-unknown}" >> $GITHUB_OUTPUT
+          
+          echo "last_notified_status=$LAST_NOTIFIED" >> $GITHUB_OUTPUT
+          echo "上次已通知的状态: $LAST_NOTIFIED"
 
-      # 3. 执行数据库 keep-alive 操作
       - name: Database Keep-Alive Operation
         id: database_operation
-        continue-on-error: true
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -64,58 +68,95 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
+          # 执行数据库插入
           if mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           INSERT INTO bh (ping_time) VALUES (NOW());
           SELECT * FROM bh ORDER BY ping_time DESC LIMIT 3;
           EOF
           then
             echo "current_outcome=success" >> $GITHUB_OUTPUT
+            echo "✅ Success: Database operation completed."
           else
             echo "current_outcome=failure" >> $GITHUB_OUTPUT
+            echo "❌ Error: Database operation failed."
             exit 1
           fi
 
-      # 4. 发送失败通知（无条件，只要数据库操作失败就发送）
-      - name: Send Telegram Failure Notification
-        if: steps.database_operation.outcome == 'failure'
+      - name: Determine If Should Send Notification
+        id: should_send
+        run: |
+          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
+          LAST_NOTIFIED="${{ steps.get_status.outputs.last_notified_status }}"
+          
+          echo "当前状态: $CURRENT"
+          echo "上次通知状态: $LAST_NOTIFIED"
+          
+          # 发送通知的条件：
+          # 1. 失败：每次都发送
+          # 2. 成功：只在状态变化时发送（unknown->success 或 failure->success）
+          if [ "$CURRENT" = "failure" ]; then
+            echo "should_send=true" >> $GITHUB_OUTPUT
+            echo "send_reason=failure" >> $GITHUB_OUTPUT
+            echo "失败，需要发送通知"
+          elif [ "$CURRENT" = "success" ] && [ "$LAST_NOTIFIED" != "success" ]; then
+            echo "should_send=true" >> $GITHUB_OUTPUT
+            echo "send_reason=success_status_change" >> $GITHUB_OUTPUT
+            echo "成功且状态变化（$LAST_NOTIFIED -> success），需要发送通知"
+          else
+            echo "should_send=false" >> $GITHUB_OUTPUT
+            echo "成功但状态未变化（已通知过成功），不发送通知"
+          fi
+
+      - name: Send Telegram Notification on Failure
+        if: steps.should_send.outputs.should_send == 'true' && steps.database_operation.outputs.current_outcome == 'failure'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           MESSAGE="⚠️ Database keep-alive FAILED at $(date) - Repository: ${{ github.repository }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
           echo "失败通知已发送"
+          
+          # 更新已通知状态为 failure
+          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          UPDATE keepalive_state 
+          SET last_status = 'failure', last_notified_status = 'failure', updated_at = NOW()
+          WHERE id = 1;
+          EOF
 
-      # 5. 判断是否需要发送成功通知
-      - name: Determine If Success Notification Needed
-        id: check_success
-        if: steps.database_operation.outputs.current_outcome == 'success'
-        run: |
-          LAST="${{ steps.get_status.outputs.last_status }}"
-          if [ "$LAST" != "success" ]; then
-            echo "should_send=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_send=false" >> $GITHUB_OUTPUT
-          fi
-
-      # 6. 发送成功通知
       - name: Send Telegram Success Notification
-        if: steps.check_success.outputs.should_send == 'true'
+        if: steps.should_send.outputs.should_send == 'true' && steps.database_operation.outputs.current_outcome == 'success'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           MESSAGE="✅ Database keep-alive SUCCESS at $(date) - Repository: ${{ github.repository }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
           echo "成功通知已发送"
+          
+          # 更新已通知状态为 success
+          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          UPDATE keepalive_state 
+          SET last_status = 'success', last_notified_status = 'success', updated_at = NOW()
+          WHERE id = 1;
+          EOF
 
-      # 7. 更新数据库状态（只在成功时更新，失败时不更新因为数据库不可写）
-      - name: Update Database State on Success
-        if: steps.database_operation.outputs.current_outcome == 'success'
+      - name: Update State Without Notification
+        if: steps.should_send.outputs.should_send == 'false'
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -123,7 +164,13 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
+          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
+          
+          # 只更新 last_status，不更新 last_notified_status
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          UPDATE keepalive_state SET last_status = 'success', updated_at = NOW() WHERE id = 1;
+          UPDATE keepalive_state 
+          SET last_status = '$CURRENT', updated_at = NOW()
+          WHERE id = 1;
           EOF
-          echo "数据库状态已更新为 success"
+          
+          echo "状态已更新为 $CURRENT，但未发送通知（上次通知状态保持不变）"
