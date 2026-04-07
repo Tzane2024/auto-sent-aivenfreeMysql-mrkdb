@@ -75,17 +75,20 @@ jobs:
           EOF
           then
             echo "current_outcome=success" >> $GITHUB_OUTPUT
+            echo "CURRENT_OUTCOME=success" >> $GITHUB_ENV
             echo "✅ Success: Database operation completed."
           else
             echo "current_outcome=failure" >> $GITHUB_OUTPUT
+            echo "CURRENT_OUTCOME=failure" >> $GITHUB_ENV
             echo "❌ Error: Database operation failed."
-            exit 1
           fi
 
       - name: Determine If Should Send Notification
         id: should_send
+        env:
+          CURRENT_OUTCOME: ${{ steps.database_operation.outputs.current_outcome }}
         run: |
-          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
+          CURRENT="$CURRENT_OUTCOME"
           LAST_NOTIFIED="${{ steps.get_status.outputs.last_notified_status }}"
           
           echo "当前状态: $CURRENT"
@@ -108,7 +111,7 @@ jobs:
           fi
 
       - name: Send Telegram Notification on Failure
-        if: steps.should_send.outputs.should_send == 'true' && steps.database_operation.outputs.current_outcome == 'failure'
+        if: always() && steps.should_send.outputs.should_send == 'true' && env.CURRENT_OUTCOME == 'failure'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -117,6 +120,7 @@ jobs:
           DB_USER: ${{ secrets.AVN_DB_USER }}
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
+          CURRENT_OUTCOME: ${{ steps.database_operation.outputs.current_outcome }}
         run: |
           MESSAGE="⚠️ Database keep-alive FAILED at $(date) - Repository: ${{ github.repository }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -132,7 +136,7 @@ jobs:
           EOF
 
       - name: Send Telegram Success Notification
-        if: steps.should_send.outputs.should_send == 'true' && steps.database_operation.outputs.current_outcome == 'success'
+        if: always() && steps.should_send.outputs.should_send == 'true' && env.CURRENT_OUTCOME == 'success'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -141,6 +145,7 @@ jobs:
           DB_USER: ${{ secrets.AVN_DB_USER }}
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
+          CURRENT_OUTCOME: ${{ steps.database_operation.outputs.current_outcome }}
         run: |
           MESSAGE="✅ Database keep-alive SUCCESS at $(date) - Repository: ${{ github.repository }}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -156,15 +161,16 @@ jobs:
           EOF
 
       - name: Update State Without Notification
-        if: steps.should_send.outputs.should_send == 'false'
+        if: always() && steps.should_send.outputs.should_send == 'false'
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
           DB_USER: ${{ secrets.AVN_DB_USER }}
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
+          CURRENT_OUTCOME: ${{ steps.database_operation.outputs.current_outcome }}
         run: |
-          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
+          CURRENT="$CURRENT_OUTCOME"
           
           # 只更新 last_status，不更新 last_notified_status
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
@@ -174,3 +180,9 @@ jobs:
           EOF
           
           echo "状态已更新为 $CURRENT，但未发送通知（上次通知状态保持不变）"
+
+      - name: Fail workflow if database operation failed
+        if: env.CURRENT_OUTCOME == 'failure'
+        run: |
+          echo "数据库操作失败，workflow 将以失败状态结束"
+          exit 1
