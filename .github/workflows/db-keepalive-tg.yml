@@ -8,20 +8,16 @@ on:
 jobs:
   ping-and-log:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 允许写入仓库
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
 
-      # 恢复上次通知状态
-      - name: Restore Last Notified Status
-        id: cache_restore
-        uses: actions/cache/restore@v3
-        with:
-          path: |
-            status.txt
-          key: keepalive-status
-
-      # 读取状态
+      # 读取状态文件
       - name: Read Last Notified Status
         id: read_status
         run: |
@@ -60,7 +56,7 @@ jobs:
       - name: Determine If Should Send Notification
         id: should_send
         run: |
-          # 获取数据库操作结果（通过步骤 outcome，而不是输出）
+          # 获取数据库操作结果
           if [ "${{ steps.database_operation.outcome }}" = "success" ]; then
             CURRENT="success"
           else
@@ -77,7 +73,7 @@ jobs:
             echo "should_send=true" >> $GITHUB_OUTPUT
             echo "message_type=failure" >> $GITHUB_OUTPUT
             echo "需要发送失败通知"
-          # 成功：只在状态变化时发送（unknown->success 或 failure->success）
+          # 成功：只在状态变化时发送
           elif [ "$CURRENT" = "success" ] && [ "$LAST" != "success" ]; then
             echo "should_send=true" >> $GITHUB_OUTPUT
             echo "message_type=success" >> $GITHUB_OUTPUT
@@ -113,8 +109,8 @@ jobs:
             -d text="${MESSAGE}"
           echo "成功通知已发送"
 
-      # 保存状态到缓存
-      - name: Save Status to Cache
+      # 更新状态文件
+      - name: Update Status File
         if: always()
         run: |
           # 获取当前状态
@@ -131,24 +127,24 @@ jobs:
           if [ "$SHOULD_SEND" = "true" ]; then
             # 发送了通知，保存当前状态
             echo "$CURRENT" > status.txt
-            echo "保存状态: $CURRENT (已通知)"
+            echo "更新状态文件: $CURRENT"
           else
             # 没发送通知，保持原状态不变
             if [ -z "$LAST" ] || [ "$LAST" = "unknown" ]; then
-              # 首次运行且成功但没发通知（理论上不会发生）
               echo "$CURRENT" > status.txt
-              echo "保存状态: $CURRENT"
+              echo "更新状态文件: $CURRENT"
             else
               echo "$LAST" > status.txt
-              echo "保存状态: $LAST (不变)"
+              echo "状态文件保持不变: $LAST"
             fi
           fi
 
-      # 保存缓存
-      - name: Save Cache
-        uses: actions/cache/save@v3
+      # 提交并推送状态文件
+      - name: Commit and Push Status File
         if: always()
-        with:
-          path: |
-            status.txt
-          key: keepalive-status
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add status.txt
+          git diff --staged --quiet || git commit -m "Update keepalive status"
+          git push
