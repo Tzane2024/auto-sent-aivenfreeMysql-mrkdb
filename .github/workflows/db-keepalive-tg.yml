@@ -9,12 +9,13 @@ jobs:
   ping-and-log:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 允许写入仓库
+      contents: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史，避免冲突
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
@@ -23,8 +24,11 @@ jobs:
       - name: Read Last Notified Status
         id: read_status
         run: |
+          # 先拉取最新代码，确保读到最新的 status.txt
+          git pull origin ${GITHUB_REF#refs/heads/} --rebase || true
+          
           if [ -f status.txt ]; then
-            LAST=$(cat status.txt)
+            LAST=$(cat status.txt | tr -d ' \n\r')
             echo "last_status=$LAST" >> $GITHUB_OUTPUT
             echo "上次通知状态: $LAST"
           else
@@ -32,7 +36,7 @@ jobs:
             echo "首次运行，上次状态: unknown"
           fi
 
-      # 数据库操作（失败时不中断）
+      # 数据库操作
       - name: Database Keep-Alive Operation
         id: database_operation
         continue-on-error: true
@@ -58,7 +62,6 @@ jobs:
       - name: Determine If Should Send Notification
         id: should_send
         run: |
-          # 获取数据库操作结果
           if [ "${{ steps.database_operation.outcome }}" = "success" ]; then
             CURRENT="success"
           else
@@ -70,19 +73,14 @@ jobs:
           echo "当前状态: $CURRENT"
           echo "上次通知状态: $LAST"
           
-          # 失败：总是发送
           if [ "$CURRENT" = "failure" ]; then
             echo "should_send=true" >> $GITHUB_OUTPUT
             echo "message_type=failure" >> $GITHUB_OUTPUT
-            echo "需要发送失败通知"
-          # 成功：只在状态变化时发送
           elif [ "$CURRENT" = "success" ] && [ "$LAST" != "success" ]; then
             echo "should_send=true" >> $GITHUB_OUTPUT
             echo "message_type=success" >> $GITHUB_OUTPUT
-            echo "需要发送成功通知（从失败恢复）"
           else
             echo "should_send=false" >> $GITHUB_OUTPUT
-            echo "连续成功，不发送通知"
           fi
 
       # 发送失败通知
@@ -96,9 +94,8 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
-          echo "失败通知已发送"
 
-      # 发送成功通知（仅恢复时）
+      # 发送成功通知
       - name: Send Telegram Success Notification
         if: steps.should_send.outputs.should_send == 'true' && steps.should_send.outputs.message_type == 'success'
         env:
@@ -109,69 +106,55 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
-          echo "成功通知已发送"
 
-      # 更新状态文件
-      - name: Update Status File
-        if: always()
+      # 使用 GitHub API 直接更新状态文件（避免 Git 冲突）
+      - name: Update Status File via API
+        if: always() && steps.should_send.outputs.should_send == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           # 获取当前状态
           if [ "${{ steps.database_operation.outcome }}" = "success" ]; then
-            CURRENT="success"
+            NEW_STATUS="success"
           else
-            CURRENT="failure"
+            NEW_STATUS="failure"
           fi
           
-          SHOULD_SEND="${{ steps.should_send.outputs.should_send }}"
-          LAST="${{ steps.read_status.outputs.last_status }}"
+          echo "更新状态文件为: $NEW_STATUS"
           
-          # 确定要保存的状态
-          if [ "$SHOULD_SEND" = "true" ]; then
-            # 发送了通知，保存当前状态
-            echo "$CURRENT" > status.txt
-            echo "更新状态文件: $CURRENT"
+          # 获取当前 status.txt 文件的 SHA
+          SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/contents/status.txt" \
+            | jq -r '.sha' 2>/dev/null || echo "")
+          
+          # 编码文件内容
+          CONTENT=$(echo -n "$NEW_STATUS" | base64 -w 0)
+          
+          # 使用 API 更新或创建文件
+          if [ -n "$SHA" ] && [ "$SHA" != "null" ]; then
+            # 更新现有文件
+            curl -s -X PUT \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/contents/status.txt" \
+              -d "{
+                \"message\": \"Update keepalive status to $NEW_STATUS\",
+                \"content\": \"$CONTENT\",
+                \"sha\": \"$SHA\",
+                \"branch\": \"${GITHUB_REF#refs/heads/}\"
+              }" > /dev/null
           else
-            # 没发送通知，保持原状态不变
-            if [ -z "$LAST" ] || [ "$LAST" = "unknown" ]; then
-              echo "$CURRENT" > status.txt
-              echo "更新状态文件: $CURRENT"
-            else
-              echo "$LAST" > status.txt
-              echo "状态文件保持不变: $LAST"
-            fi
-          fi
-
-      # 提交并推送状态文件（解决冲突版）
-      - name: Commit and Push Status File
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 配置 git
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 获取当前分支名
-          if [ -n "${{ github.head_ref }}" ]; then
-            BRANCH_NAME=${{ github.head_ref }}
-          else
-            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+            # 创建新文件
+            curl -s -X PUT \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/contents/status.txt" \
+              -d "{
+                \"message\": \"Create keepalive status file\",
+                \"content\": \"$CONTENT\",
+                \"branch\": \"${GITHUB_REF#refs/heads/}\"
+              }" > /dev/null
           fi
           
-          echo "当前分支: $BRANCH_NAME"
-          
-          # 拉取最新的远程更改（使用 rebase 避免合并提交）
-          git pull origin $BRANCH_NAME --rebase --autostash || true
-          
-          # 添加状态文件
-          git add status.txt
-          
-          # 检查是否有变更需要提交
-          if git diff --staged --quiet; then
-            echo "状态文件无变化，无需提交"
-          else
-            git commit -m "Update keepalive status [skip ci]"
-            # 推送更改，使用 token 进行认证
-            git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git $BRANCH_NAME
-            echo "状态文件已推送"
-          fi
+          echo "状态文件已通过 API 更新"
